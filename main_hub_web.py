@@ -21,30 +21,98 @@ from PyQt5.QtWidgets import (
 )
 
 # ==========================================================
+# ✅ onefile 路径策略：
+# - rsrc(): 读取内置资源（_MEIPASS 或源码目录）
+# - rwrite(): 写入用户文件（exe 同级目录）
+# ==========================================================
+def setup_dll_search_path():
+    """
+    双保险：确保 torch / conda 的 DLL 目录进入搜索路径。
+    - onedir: <exe_dir>/_internal/torch/lib 及 <exe_dir>/_internal/Library/bin
+    - onefile: <_MEIPASS>/torch/lib 及 <_MEIPASS>/Library/bin
+    """
+    import os, sys
+    from pathlib import Path
+
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+    def add(p: Path):
+        if not p.exists():
+            return
+        try:
+            os.add_dll_directory(str(p))
+        except Exception:
+            os.environ["PATH"] = str(p) + os.pathsep + os.environ.get("PATH", "")
+
+    roots = []
+    if getattr(sys, "frozen", False):
+        roots.append(Path(sys.executable).resolve().parent)
+        if hasattr(sys, "_MEIPASS"):
+            roots.append(Path(sys._MEIPASS))
+    else:
+        roots.append(Path(__file__).resolve().parent)
+
+    for root in roots:
+        base = root / "_internal" if (root / "_internal").exists() else root
+        for p in [
+            base / "torch" / "lib",
+            base / "Library" / "bin",
+            base / "PyQt5" / "Qt5" / "bin",
+            base / "av.libs",
+            base / "numpy.libs",
+            base / "scipy.libs",
+        ]:
+            add(p)
+
+def exe_dir() -> Path:
+    """exe 所在目录（可写、用户可见）"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def app_root() -> Path:
+    """
+    内置资源根目录：
+    - PyInstaller onefile：sys._MEIPASS（临时解压目录，只读）
+    - 源码运行：当前 .py 所在目录
+    """
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS).resolve()
+    return Path(__file__).resolve().parent
+
+
+def rsrc(*parts) -> Path:
+    """读取内置资源路径（只读）"""
+    return app_root().joinpath(*parts)
+
+
+def rwrite(*parts) -> Path:
+    """写入用户文件路径（可写）"""
+    return exe_dir().joinpath(*parts)
+
+
+# ==========================================================
 # ⭐关键修复：必须在 QApplication/QGuiApplication 构造前设置
 # ==========================================================
 QCoreApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
 
 # ==========================================================
 # ⭐Logo 读取（源码/打包兼容）
-#   期望路径：<代码同级目录>/logo/清泰logo.ico
+# - 优先：exe 同级 logo（方便交付替换）
+# - 兜底：onefile 内置资源（_MEIPASS/logo）
 # ==========================================================
-def get_base_dir() -> Path:
-    """
-    运行目录（兼容 PyInstaller）：
-    - 打包后：sys._MEIPASS
-    - 源码运行：当前 .py 所在目录
-    """
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        return Path(sys._MEIPASS)
-    return Path(__file__).resolve().parent
-
-
 def load_app_icon() -> QtGui.QIcon:
-    base_dir = get_base_dir()
-    ico_path = base_dir / "logo" / "清泰logo.ico"
-    if ico_path.is_file():
-        return QtGui.QIcon(str(ico_path))
+    p1 = exe_dir() / "logo" / "清泰logo.ico"
+    if p1.is_file():
+        return QtGui.QIcon(str(p1))
+
+    p2 = rsrc("logo", "清泰logo.ico")
+    if p2.is_file():
+        return QtGui.QIcon(str(p2))
+
     return QtGui.QIcon()
 
 
@@ -146,12 +214,12 @@ def is_not_expired(exp_str: str) -> bool:
     return date.today() <= exp_d
 
 
-def write_expired_log(exp_str: str, local_serial: str, base_dir: Path) -> Path:
+def write_expired_log(exp_str: str, local_serial: str, writable_base: Path) -> Path:
     """
-    仅用于“过期”场景：生成日志，包含注册所需机器码
-    输出到：<程序目录>/CustomerLicense/license_expired_YYYYMMDD_HHMMSS.log
+    onefile 下必须写到可写目录（exe 同级）
+    输出到：<exe目录>/CustomerLicense/license_expired_YYYYMMDD_HHMMSS.log
     """
-    out_dir = base_dir / "CustomerLicense"
+    out_dir = writable_base / "CustomerLicense"
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = out_dir / f"license_expired_{ts}.log"
@@ -170,7 +238,7 @@ def write_expired_log(exp_str: str, local_serial: str, base_dir: Path) -> Path:
 class LicenseRepairDialog(QDialog):
     """
     校验失败时：显示本机机器码 + 让用户粘贴 license.txt 内容（两行）
-    点击写入：覆盖 CustomerLicense/license.txt
+    点击写入：覆盖（或创建）<exe目录>/CustomerLicense/license.txt
     """
     def __init__(self, local_serial: str, license_path: Path, parent: QWidget = None):
         super().__init__(parent)
@@ -304,9 +372,13 @@ def _license_fail_flow(parent: QWidget, local_serial: str, lic_path: Path):
 
 
 def verify_or_exit(parent: QWidget = None) -> None:
-    base_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).parent))
-    pub_path = base_dir / "CustomerLicense" / "public_key.pem"
-    lic_path = base_dir / "CustomerLicense" / "license.txt"
+    # public_key.pem：允许外置（exe 同级）或内置（_MEIPASS）
+    pub_path_external = rwrite("CustomerLicense", "public_key.pem")
+    pub_path_embedded = rsrc("CustomerLicense", "public_key.pem")
+    pub_path = pub_path_external if pub_path_external.is_file() else pub_path_embedded
+
+    # license.txt：必须外置（exe 同级，可写）
+    lic_path = rwrite("CustomerLicense", "license.txt")
 
     local_serial = get_local_serial()
 
@@ -336,7 +408,7 @@ def verify_or_exit(parent: QWidget = None) -> None:
 
     if not is_not_expired(exp):
         try:
-            log_path = write_expired_log(exp, local_serial, base_dir)
+            log_path = write_expired_log(exp, local_serial, exe_dir())
         except Exception:
             log_path = None
 
@@ -710,7 +782,6 @@ class HubWindow(QMainWindow):
                 if self.ultra_ui is None:
                     page = make_placeholder("超声波模块缺失", "未找到 wl300d_ultra_can_scifi_gui.py。", color="#fb7185")
                 else:
-                    # 约定：你的 wl300d_ultra_can_scifi_gui.py 里有 MainWindow()
                     page = self.ultra_ui.MainWindow()
             else:
                 page = make_placeholder("无效页面", f"idx={idx}", color="#fb7185")
@@ -730,17 +801,19 @@ class HubWindow(QMainWindow):
             self.lab_rec_state.setStyleSheet("color:#94a3b8;font-size:12px;font-weight:800;")
 
     def on_start_record(self):
-        here = os.path.dirname(os.path.abspath(__file__))
-        out_dir = os.path.join(here, "recordings")
+        out_dir = str(rwrite("recordings"))
         os.makedirs(out_dir, exist_ok=True)
+
         default_name = datetime.now().strftime("hub_record_%Y%m%d_%H%M%S.mp4")
         default_path = os.path.join(out_dir, default_name)
+
         out_path, _ = QFileDialog.getSaveFileName(
             self, "选择录制保存位置", default_path,
             "MP4 Video (*.mp4);;All Files (*.*)"
         )
         if not out_path:
             return
+
         ok, msg = self.recorder.start(out_path)
         if not ok:
             QMessageBox.critical(self, "录制失败", msg)
@@ -773,6 +846,9 @@ def main():
     # ==========================================================
     # ⭐关键修复：双保险，必须在 QApplication() 之前设置
     # ==========================================================
+
+    setup_dll_search_path()
+
     QApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
     QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
     QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
@@ -816,7 +892,6 @@ def main():
             else:
                 radar_ui = None
 
-        # ✅ 新增：超声波测距模块
         ultra_ui = None
         try:
             import wl300d_ultra_can_scifi_gui as ultra_ui
