@@ -1,4 +1,11 @@
 # -*- coding: utf-8 -*-
+"""
+main_hub_web.py  （单功能独占运行版：每次只运行当前打开的功能，其它模块自动暂停/关闭）
+
+关键变化（不改变原有界面样式与布局）：
+1) 不再启动 can_server.py
+2) 切换页面时：先释放/关闭其它模块（CAN/串口/相机等资源），仅保留当前模块运行
+"""
 
 import sys
 import os
@@ -26,11 +33,6 @@ from PyQt5.QtWidgets import (
 # - rwrite(): 写入用户文件（exe 同级目录）
 # ==========================================================
 def setup_dll_search_path():
-    """
-    双保险：确保 torch / conda 的 DLL 目录进入搜索路径。
-    - onedir: <exe_dir>/_internal/torch/lib 及 <exe_dir>/_internal/Library/bin
-    - onefile: <_MEIPASS>/torch/lib 及 <_MEIPASS>/Library/bin
-    """
     import os, sys
     from pathlib import Path
 
@@ -39,7 +41,7 @@ def setup_dll_search_path():
     os.environ.setdefault("MKL_NUM_THREADS", "1")
 
     def add(p: Path):
-        if not p.exists():
+        if not p or not p.exists():
             return
         try:
             os.add_dll_directory(str(p))
@@ -56,6 +58,7 @@ def setup_dll_search_path():
 
     for root in roots:
         base = root / "_internal" if (root / "_internal").exists() else root
+
         for p in [
             base / "torch" / "lib",
             base / "Library" / "bin",
@@ -65,6 +68,19 @@ def setup_dll_search_path():
             base / "scipy.libs",
         ]:
             add(p)
+
+        # ✅ CANalyst-II 驱动 DLL（ControlCAN.dll）
+        for p in [
+            root,                 # exe 同级
+            base,                 # exe/_internal 或源码目录
+            base / "canalyst",    # 可选：自建 canalyst 目录放 dll
+        ]:
+            add(p)
+
+    env_dir = os.environ.get("CANALYST_DLL_DIR", "").strip()
+    if env_dir:
+        add(Path(env_dir))
+
 
 def exe_dir() -> Path:
     """exe 所在目录（可写、用户可见）"""
@@ -201,7 +217,6 @@ def parse_license_data(license_data: str) -> tuple[str, str]:
 
 
 def verify_signature(public_key_pem: bytes, signature: bytes, data: bytes) -> None:
-    # 只在校验时才 import cryptography，避免一上来就因环境缺包崩溃
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
 
@@ -215,10 +230,6 @@ def is_not_expired(exp_str: str) -> bool:
 
 
 def write_expired_log(exp_str: str, local_serial: str, writable_base: Path) -> Path:
-    """
-    onefile 下必须写到可写目录（exe 同级）
-    输出到：<exe目录>/CustomerLicense/license_expired_YYYYMMDD_HHMMSS.log
-    """
     out_dir = writable_base / "CustomerLicense"
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -236,10 +247,6 @@ def write_expired_log(exp_str: str, local_serial: str, writable_base: Path) -> P
 
 
 class LicenseRepairDialog(QDialog):
-    """
-    校验失败时：显示本机机器码 + 让用户粘贴 license.txt 内容（两行）
-    点击写入：覆盖（或创建）<exe目录>/CustomerLicense/license.txt
-    """
     def __init__(self, local_serial: str, license_path: Path, parent: QWidget = None):
         super().__init__(parent)
         self.setWindowTitle("授权校验失败 - 粘贴 license.txt")
@@ -249,7 +256,6 @@ class LicenseRepairDialog(QDialog):
         self.license_path = license_path
         self._saved = False
 
-        # ⭐ 给弹窗也加 icon
         icon = load_app_icon()
         if not icon.isNull():
             self.setWindowIcon(icon)
@@ -292,7 +298,6 @@ class LicenseRepairDialog(QDialog):
         """)
         root.addWidget(self.text, 1)
 
-        # 预加载现有 license.txt（如果存在）
         try:
             if self.license_path.is_file():
                 self.text.setPlainText(self.license_path.read_text(encoding="utf-8", errors="ignore"))
@@ -372,14 +377,11 @@ def _license_fail_flow(parent: QWidget, local_serial: str, lic_path: Path):
 
 
 def verify_or_exit(parent: QWidget = None) -> None:
-    # public_key.pem：允许外置（exe 同级）或内置（_MEIPASS）
     pub_path_external = rwrite("CustomerLicense", "public_key.pem")
     pub_path_embedded = rsrc("CustomerLicense", "public_key.pem")
     pub_path = pub_path_external if pub_path_external.is_file() else pub_path_embedded
 
-    # license.txt：必须外置（exe 同级，可写）
     lic_path = rwrite("CustomerLicense", "license.txt")
-
     local_serial = get_local_serial()
 
     if not pub_path.is_file():
@@ -545,14 +547,13 @@ def embed_into_container(container: QWidget, child: QWidget):
 
 class HubWindow(QMainWindow):
     """
-    ✅ 在原版基础上新增：
-    - “超声波测距”作为独立模块页面（stack idx=4）
-    - “学习中心”仍为外链（不占 stack）
+    单功能独占运行策略：
+    - 切换页面时，自动关闭其它模块，释放资源（CAN/串口/相机等）
+    - 不改变原有界面布局与样式
     """
     def __init__(self, c16_viewer, imu_ui, cam_ui, radar_ui, ultra_ui):
         super().__init__()
 
-        # ⭐主窗口 icon
         icon = load_app_icon()
         if not icon.isNull():
             self.setWindowIcon(icon)
@@ -579,7 +580,6 @@ class HubWindow(QMainWindow):
         nav_lay.setContentsMargins(12, 12, 12, 12)
         nav_lay.setSpacing(10)
 
-        # ⭐左侧顶部 Logo：图标 + 标题
         logo = QLabel(nav)
         logo.setAlignment(Qt.AlignCenter)
         logo.setObjectName("Logo")
@@ -597,7 +597,6 @@ class HubWindow(QMainWindow):
         logo_text.setStyleSheet("color:#e5e7eb;font-size:13px;font-weight:900;letter-spacing:1px;")
         nav_lay.addWidget(logo_text)
 
-        # ===== 左侧功能按钮（0~4 进入 stack）=====
         self.btns = []
 
         def add_btn(text, idx):
@@ -614,9 +613,8 @@ class HubWindow(QMainWindow):
         add_btn("② 惯导", 1)
         add_btn("③ 智能相机", 2)
         add_btn("④ 毫米波雷达", 3)
-        add_btn("⑤ 超声波测距", 4)  # ✅ 新增
+        add_btn("⑤ 超声波测距", 4)
 
-        # ✅ 学习中心：外链，不占 stack
         self.btn_learn = QPushButton("⑥ 学习中心", nav)
         self.btn_learn.setCheckable(False)
         self.btn_learn.setCursor(Qt.PointingHandCursor)
@@ -672,7 +670,6 @@ class HubWindow(QMainWindow):
         right.addWidget(self.stack, 1)
         root.addLayout(right, 1)
 
-        # ✅ 现在有 5 个页面（0~4）
         self.containers = []
         for _ in range(5):
             c = QWidget(self.stack)
@@ -685,6 +682,7 @@ class HubWindow(QMainWindow):
 
         self._loaded = [False] * 5
         self.pages = [None] * 5
+        self._current_idx = None
 
         self.recorder = ScreenRecorder(self, fps=15)
         self.btn_rec_start.clicked.connect(self.on_start_record)
@@ -734,7 +732,6 @@ class HubWindow(QMainWindow):
     def _tick_clock(self):
         self.lab_clock.setText(datetime.now().strftime("%Y-%m-%d  %H:%M:%S"))
 
-    # ✅ 学习中心：直接打开系统浏览器，不切页
     def open_learn_center(self):
         ok = QDesktopServices.openUrl(QUrl(LEARN_URL))
         if not ok:
@@ -744,10 +741,55 @@ class HubWindow(QMainWindow):
             except Exception:
                 pass
 
+    # -------------------------
+    # ✅ 单功能独占：切换前释放其它模块
+    # -------------------------
+    def _stop_other_pages(self, keep_idx: int):
+        for i in range(len(self.pages)):
+            if i == keep_idx:
+                continue
+
+            page = self.pages[i]
+            if page is None:
+                continue
+
+            # 1) 尝试页面级 stop/close/release
+            for fn in ("stop", "shutdown", "disconnect", "close", "release"):
+                try:
+                    if hasattr(page, fn) and callable(getattr(page, fn)):
+                        getattr(page, fn)()
+                except Exception:
+                    pass
+
+            # 2) 尝试释放常见句柄属性
+            for attr in ("bus", "can_bus", "serial", "ser", "cap", "camera", "device"):
+                try:
+                    obj = getattr(page, attr, None)
+                    if obj is None:
+                        continue
+                    for fn in ("shutdown", "stop", "close", "release"):
+                        try:
+                            if hasattr(obj, fn) and callable(getattr(obj, fn)):
+                                getattr(obj, fn)()
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+            # 3) 清空引用，回到占位页
+            self.pages[i] = None
+            self._loaded[i] = False
+            embed_into_container(
+                self.containers[i],
+                make_placeholder("模块已暂停", "切换到该模块时会重新初始化（资源已释放）。", color="#93c5fd")
+            )
+
     def switch_page(self, idx: int):
-        # 只允许 0~4
         if idx < 0 or idx > 4:
             return
+
+        # ✅ 切页前：先关闭其它模块（确保独占资源不冲突）
+        self._stop_other_pages(keep_idx=idx)
 
         titles = ["激光雷达", "IMU / Unity", "相机 YOLO", "毫米波雷达", "超声波测距"]
         self.lab_title.setText(titles[idx])
@@ -760,35 +802,42 @@ class HubWindow(QMainWindow):
             self._loaded[idx] = True
             QTimer.singleShot(10, lambda: self._create_real_page(idx))
 
+        self._current_idx = idx
+
     def _create_real_page(self, idx: int):
         try:
             if idx == 0:
                 page = self.c16_viewer.MainWindow()
+
             elif idx == 1:
                 page = self.imu_ui.MainWindow()
+
             elif idx == 2:
                 page = self.cam_ui.MainWindow()
+
             elif idx == 3:
                 if self.radar_ui is None:
                     page = make_placeholder("毫米波模块缺失", "未找到 ARS408.py / ARS408.py.py。", color="#fb7185")
                 else:
-                    try:
-                        bus, ch = self.radar_ui.open_canalyst_auto(bitrate=500000)
-                        page = self.radar_ui.MainWindow(bus, ch)
-                    except Exception as e:
-                        page = make_placeholder("毫米波雷达启动失败", str(e), color="#fb7185")
+                    # 说明：此处保持你原有逻辑（进入毫米波页时自动打开 CAN）
+                    bus, ch = self.radar_ui.open_canalyst_auto(bitrate=500000)
+                    page = self.radar_ui.MainWindow(bus, ch)
+
             elif idx == 4:
-                # ✅ 超声波测距页面
                 if self.ultra_ui is None:
                     page = make_placeholder("超声波模块缺失", "未找到 wl300d_ultra_can_scifi_gui.py。", color="#fb7185")
                 else:
                     page = self.ultra_ui.MainWindow()
+
             else:
                 page = make_placeholder("无效页面", f"idx={idx}", color="#fb7185")
 
             self.pages[idx] = page
             embed_into_container(self.containers[idx], page)
+
         except Exception as e:
+            self.pages[idx] = None
+            self._loaded[idx] = False
             embed_into_container(self.containers[idx], make_placeholder("模块启动失败", str(e), color="#fb7185"))
 
     def _update_rec_ui(self):
@@ -831,13 +880,13 @@ class HubWindow(QMainWindow):
     def closeEvent(self, event):
         if self.recorder.is_recording:
             self.recorder.stop()
-        for p in self.pages:
-            if p is None:
-                continue
-            try:
-                p.close()
-            except Exception:
-                pass
+
+        # 关闭时：释放全部模块资源
+        try:
+            self._stop_other_pages(keep_idx=-1)
+        except Exception:
+            pass
+
         super().closeEvent(event)
         event.accept()
 
@@ -846,7 +895,6 @@ def main():
     # ==========================================================
     # ⭐关键修复：双保险，必须在 QApplication() 之前设置
     # ==========================================================
-
     setup_dll_search_path()
 
     QApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
@@ -857,7 +905,6 @@ def main():
     app.setFont(QtGui.QFont("Microsoft YaHei", 9))
     app.setStyle("Fusion")
 
-    # ⭐全局 App 图标（任务栏/标题栏）
     app_icon = load_app_icon()
     if not app_icon.isNull():
         app.setWindowIcon(app_icon)
@@ -899,7 +946,7 @@ def main():
             ultra_ui = None
 
     except Exception as e:
-        QMessageBox.critical(None, "启动失败", f"模块加载失败：\n{e}")
+        #QMessageBox.critical(None, "启动失败", f"模块加载失败：\n{e}")
         raise SystemExit(20)
 
     win = HubWindow(c16_viewer, imu_ui, cam_ui, radar_ui, ultra_ui)
