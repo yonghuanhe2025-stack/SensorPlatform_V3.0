@@ -1,0 +1,22 @@
+环境配置命令：
+conda env create -f .\environment.yml
+conda activate ROS_platform
+
+打包命令：
+pyinstaller .\main_hub_web.py `
+  --noconfirm --clean `
+  --onedir --console `
+  --name SensorPlatform `
+  --icon .\logo\清泰logo.ico `
+  --paths . `
+  --hidden-import can.interfaces.canalystii `
+  --hidden-import canalystii `
+  --collect-submodules can `
+  --collect-submodules can.interfaces `
+  --collect-submodules usb `
+  --add-data ".\logo;logo" `
+  --add-data ".\web;web" `
+  --add-data ".\tilecache;tilecache" `
+  --add-data ".\CustomerLicense;CustomerLicense" `
+  --add-data ".\datasets;datasets" `
+  --add-data ".\yolo11n.pt;."

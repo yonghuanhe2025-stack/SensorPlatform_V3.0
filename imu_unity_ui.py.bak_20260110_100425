@@ -1,0 +1,1424 @@
+# imu_unity_ui.py
+# -*- coding: utf-8 -*-
+
+import sys
+import os
+import math
+import time
+import struct
+import csv
+import numpy as np
+
+from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal, QTimer, QUrl
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QHBoxLayout, QSplitter, QToolBar, QAction,
+    QLabel, QComboBox, QCheckBox, QGroupBox, QStyle,
+    QFileDialog, QMessageBox
+)
+
+import pyqtgraph as pg
+import pyqtgraph.opengl as gl
+
+# 串口库（用于列出 COM 口 & 打开串口）
+try:
+    import serial
+    import serial.tools.list_ports as list_ports
+except ImportError:
+    serial = None
+    list_ports = None
+
+# QtWebEngine（地图叠加轨迹用，可选）
+try:
+    from PyQt5.QtWebEngineWidgets import QWebEngineView
+    WEBENGINE_OK = True
+except Exception:
+    QWebEngineView = None
+    WEBENGINE_OK = False
+
+
+# ===================== 工具函数 =====================
+
+def _angle_wrap_deg(a):
+    """把角度 wrap 到 (-180, 180]，用于相对差值更稳定"""
+    a = (a + 180.0) % 360.0 - 180.0
+    return a
+
+
+def geo_to_enu(lat_deg, lon_deg, alt_m, lat0_deg, lon0_deg, alt0_m):
+    """
+    简单经纬度 -> ENU（东、北、天）局部坐标近似
+    """
+    R = 6378137.0
+    lat0 = math.radians(lat0_deg)
+    lat = math.radians(lat_deg)
+    lon = math.radians(lon_deg)
+    lon0 = math.radians(lon0_deg)
+
+    dlat = lat - lat0
+    dlon = lon - lon0
+
+    east = R * dlon * math.cos(lat0)
+    north = R * dlat
+    up = alt_m - alt0_m
+    return east, north, up
+
+
+def load_csv_generic(path):
+    """
+    读取 CSV，尝试解析惯导 / GPS 常见字段：
+    time, lat, lon, alt, roll, pitch, yaw,
+    ax, ay, az, gx, gy, gz, speed,
+    d0, d1, d2（惯导标志）
+    """
+    try:
+        data = np.genfromtxt(
+            path, delimiter=",", names=True, dtype=None, encoding="utf-8"
+        )
+    except Exception as e:
+        raise RuntimeError(f"读取 CSV 失败: {e}")
+
+    names = [n.lower() for n in data.dtype.names]
+
+    def get_col(*cands):
+        for c in cands:
+            if c in names:
+                return data[c]
+        return None
+
+    # 基础
+    t = get_col("time", "timestamp", "sec", "seconds")
+    lat = get_col("lat", "latitude")
+    lon = get_col("lon", "longitude")
+    alt = get_col("alt", "height", "altitude")
+
+    # 姿态角
+    roll = get_col("roll", "phi", "angle_x", "roll_deg")
+    pitch = get_col("pitch", "theta", "angle_y", "pitch_deg")
+    yaw = get_col("yaw", "heading", "psi", "angle_z", "yaw_deg")
+
+    # 线加速度
+    ax = get_col("ax", "accx", "acc_x", "accex", "ax_g")
+    ay = get_col("ay", "accy", "acc_y", "accey", "ay_g")
+    az = get_col("az", "accz", "acc_z", "accez", "az_g")
+
+    # 角速度
+    gx = get_col("gx", "gyrox", "gyro_x", "wx")
+    gy = get_col("gy", "gyroy", "gyro_y", "wy")
+    gz = get_col("gz", "gyroz", "gyro_z", "wz")
+
+    # 地速 / 速度
+    speed = get_col("speed", "groundspeed", "ground_speed", "vel", "velocity")
+
+    # 惯导标志 D0/D1/D2
+    d0 = get_col("d0", "navflag", "flag0")
+    d1 = get_col("d1", "algflag", "flag1")
+    d2 = get_col("d2", "spdflag", "flag2")
+
+    if t is None or lat is None or lon is None or alt is None:
+        raise RuntimeError("CSV 至少需要包含列: time, lat, lon, alt")
+
+    def arr_or_none(col, dtype=float):
+        if col is None:
+            return None
+        return np.asarray(col, dtype=dtype)
+
+    return {
+        "time": np.asarray(t, dtype=float),
+        "lat": np.asarray(lat, dtype=float),
+        "lon": np.asarray(lon, dtype=float),
+        "alt": np.asarray(alt, dtype=float),
+
+        "roll": arr_or_none(roll),
+        "pitch": arr_or_none(pitch),
+        "yaw": arr_or_none(yaw),
+
+        "ax": arr_or_none(ax),
+        "ay": arr_or_none(ay),
+        "az": arr_or_none(az),
+
+        "gx": arr_or_none(gx),
+        "gy": arr_or_none(gy),
+        "gz": arr_or_none(gz),
+
+        "speed": arr_or_none(speed),
+
+        "d0": arr_or_none(d0, dtype=int),
+        "d1": arr_or_none(d1, dtype=int),
+        "d2": arr_or_none(d2, dtype=int),
+    }
+
+
+def euler_to_rotation_matrix(roll_deg, pitch_deg, yaw_deg):
+    """
+    欧拉角(度) -> 旋转矩阵 (3x3)
+    采用 Z(航向) * Y(俯仰) * X(横滚) 顺序
+    """
+    r = math.radians(roll_deg)
+    p = math.radians(pitch_deg)
+    y = math.radians(yaw_deg)
+
+    Rx = np.array([
+        [1, 0, 0],
+        [0, math.cos(r), -math.sin(r)],
+        [0, math.sin(r),  math.cos(r)],
+    ], dtype=float)
+
+    Ry = np.array([
+        [ math.cos(p), 0, math.sin(p)],
+        [ 0,          1,          0],
+        [-math.sin(p), 0, math.cos(p)],
+    ], dtype=float)
+
+    Rz = np.array([
+        [math.cos(y), -math.sin(y), 0],
+        [math.sin(y),  math.cos(y), 0],
+        [0, 0, 1],
+    ], dtype=float)
+
+    return Rz @ Ry @ Rx
+
+
+# ===================== 地图窗口（GPS轨迹叠加，国内可用） =====================
+
+class MapWindow(QMainWindow):
+    """Leaflet 地图窗口：优先国内可用瓦片（高德），Leaflet 优先本地加载（无外网也能开）"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("GPS 轨迹地图叠加（Leaflet / 国内可用）")
+        self.resize(1000, 700)
+
+        central = QWidget()
+        self.setCentralWidget(central)
+        lay = QVBoxLayout(central)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        if not WEBENGINE_OK:
+            lab = QLabel("未检测到 PyQtWebEngine，地图功能不可用。\n\n"
+                         "解决：pip install PyQtWebEngine\n"
+                         "或在 conda 环境安装对应包。")
+            lab.setAlignment(Qt.AlignCenter)
+            lay.addWidget(lab)
+            self.web = None
+            self._ready = False
+            self._pending = []
+            return
+
+        self.web = QWebEngineView()
+        lay.addWidget(self.web)
+
+        self._ready = False
+        self._pending = []
+
+        self.web.loadFinished.connect(self._on_load_finished)
+
+        base_dir = QUrl.fromLocalFile(os.path.abspath(os.path.dirname(__file__)) + os.sep)
+        self.web.setHtml(self._html(), base_dir)
+
+    def _on_load_finished(self, ok: bool):
+        self._ready = bool(ok)
+        if self._ready and self._pending:
+            for lat, lon in self._pending:
+                self.add_gps_point(lat, lon)
+            self._pending.clear()
+
+    def _html(self) -> str:
+        return r"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>GPS Track</title>
+
+  <!-- Leaflet：优先本地 -->
+  <link rel="stylesheet" href="web/leaflet/leaflet.css"
+        onerror="this.onerror=null;this.href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css';"/>
+  <script src="web/leaflet/leaflet.js"
+          onerror="this.onerror=null;this.src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js';"></script>
+
+  <style>
+    html, body, #map { height: 100%; margin: 0; background:#000; }
+    .hud {
+      position: absolute; z-index: 9999; left: 12px; top: 10px;
+      background: rgba(0,0,0,0.55); color: #fff; padding: 8px 10px;
+      border-radius: 10px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      box-shadow: 0 8px 20px rgba(0,0,0,0.35);
+      backdrop-filter: blur(6px);
+    }
+    .hud b { color: #7CFF8A; }
+    .hint { opacity:0.85; font-size:12px; margin-top:4px; }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+<div class="hud">
+  <div><b>GPS Track</b> overlay</div>
+  <div id="stat">points: 0</div>
+  <div class="hint">底图：默认高德（国内可用）；可切换 OSM</div>
+</div>
+
+<script>
+  function ensureLeafletReady(cb){
+    let t0 = Date.now();
+    let timer = setInterval(()=>{
+      if (window.L && L.map) {
+        clearInterval(timer); cb(); return;
+      }
+      if (Date.now() - t0 > 8000) {
+        clearInterval(timer);
+        document.querySelector('.hud').innerHTML =
+          "<div><b>Leaflet 加载失败</b></div><div class='hint'>请把 leaflet.js/css 放到 ./web/leaflet/</div>";
+      }
+    }, 50);
+  }
+
+  ensureLeafletReady(function(){
+    let map = L.map('map', { zoomControl:true }).setView([30, 103], 5);
+
+    // 国内可用：高德瓦片
+    let gaodeVec = L.tileLayer(
+      'https://webrd0{s}.is.autonavi.com/appmaptile?style=7&x={x}&y={y}&z={z}',
+      { subdomains: ['1','2','3','4'], maxZoom: 19, attribution: 'AMap' }
+    );
+
+    let gaodeImg = L.tileLayer(
+      'https://webst0{s}.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}',
+      { subdomains: ['1','2','3','4'], maxZoom: 19, attribution: 'AMap' }
+    );
+
+    // 备用：OSM（国内不稳定）
+    let osm = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19, attribution: '&copy; OpenStreetMap'
+    });
+
+    gaodeVec.addTo(map);
+
+    L.control.layers({
+      "高德-矢量": gaodeVec,
+      "高德-影像": gaodeImg,
+      "OSM(备用)": osm
+    }, null, {collapsed: true}).addTo(map);
+
+    let pts = [];
+    let poly = L.polyline([], {color:'#00ff6a', weight:3}).addTo(map);
+    let marker = L.circleMarker([30,103], {
+      radius:6, color:'#ff3b30', fillColor:'#ff3b30', fillOpacity:1
+    }).addTo(map);
+
+    function addPoint(lat, lon) {
+      pts.push([lat, lon]);
+      poly.addLatLng([lat, lon]);
+      marker.setLatLng([lat, lon]);
+      document.getElementById('stat').innerText = 'points: ' + pts.length;
+
+      if (pts.length === 1) {
+        map.setView([lat, lon], 17);
+      } else {
+        try { map.fitBounds(poly.getBounds(), {padding:[30,30]}); } catch(e) {}
+      }
+    }
+
+    window.addPoint = addPoint;
+  });
+</script>
+</body>
+</html>
+        """
+
+    def add_gps_point(self, lat: float, lon: float):
+        if not self.web:
+            return
+        if not self._ready:
+            self._pending.append((lat, lon))
+            return
+        js = f"window.addPoint({float(lat):.10f}, {float(lon):.10f});"
+        self.web.page().runJavaScript(js)
+
+
+# ===================== 串口读取线程（WIT 私有协议，0x55 帧） =====================
+
+class WITSerialReader(QThread):
+    """
+    WIT 私有协议解析：
+      帧格式：0x55 | ID | 8 bytes 数据 | 校验和
+      校验和 = (前 10 字节求和) & 0xFF
+
+    采用常见 WT 模块系数：
+      0x51 加速度：raw / 32768 * 16 g
+      0x52 角速度：raw / 32768 * 2000 deg/s
+      0x53 姿态角：raw / 32768 * 180 deg
+    """
+
+    new_sample = pyqtSignal(dict)
+
+    def __init__(self, port_name, baud, parent=None):
+        super().__init__(parent)
+        self.port_name = port_name
+        self.baud = baud
+        self.running = True
+
+    def run(self):
+        if serial is None:
+            print("[SERIAL] pyserial 未安装，无法打开串口")
+            return
+
+        try:
+            ser = serial.Serial(
+                port=self.port_name,
+                baudrate=self.baud,
+                timeout=0.01,
+            )
+        except Exception as e:
+            print("[SERIAL] 打开串口失败:", e)
+            return
+
+        print(f"[SERIAL] Open {self.port_name}@{self.baud}")
+
+        buf = bytearray()
+        last_acc = None
+        last_gyro = None
+
+        try:
+            while self.running:
+                try:
+                    data = ser.read(256)
+                except Exception as e:
+                    print("[SERIAL] 读取错误:", e)
+                    break
+
+                if not data:
+                    continue
+
+                buf.extend(data)
+
+                while len(buf) >= 11:
+                    if buf[0] != 0x55:
+                        buf.pop(0)
+                        continue
+
+                    frame = buf[:11]
+                    del buf[:11]
+
+                    if (sum(frame[0:10]) & 0xFF) != frame[10]:
+                        continue
+
+                    fid = frame[1]
+                    dat = frame[2:10]
+                    vals = struct.unpack('<hhhh', dat)
+
+                    if fid == 0x51:
+                        ax = vals[0] / 32768.0 * 16.0
+                        ay = vals[1] / 32768.0 * 16.0
+                        az = vals[2] / 32768.0 * 16.0
+                        last_acc = (ax, ay, az)
+
+                    elif fid == 0x52:
+                        gx = vals[0] / 32768.0 * 2000.0
+                        gy = vals[1] / 32768.0 * 2000.0
+                        gz = vals[2] / 32768.0 * 2000.0
+                        last_gyro = (gx, gy, gz)
+
+                    elif fid == 0x53:
+                        roll = vals[0] / 32768.0 * 180.0
+                        pitch = vals[1] / 32768.0 * 180.0
+                        yaw = vals[2] / 32768.0 * 180.0
+
+                        now = time.time()
+                        sample = {
+                            "time": now,
+                            # 默认没有 GPS；如果你后续解析到GPS，把 lat/lon/alt 填进来即可
+                            "lat": None,
+                            "lon": None,
+                            "alt": None,
+                            "roll": roll,
+                            "pitch": pitch,
+                            "yaw": yaw,
+                            "ax": None if last_acc is None else last_acc[0],
+                            "ay": None if last_acc is None else last_acc[1],
+                            "az": None if last_acc is None else last_acc[2],
+                            "gx": None if last_gyro is None else last_gyro[0],
+                            "gy": None if last_gyro is None else last_gyro[1],
+                            "gz": None if last_gyro is None else last_gyro[2],
+                            "speed": None,
+                            "d0": None,
+                            "d1": None,
+                            "d2": None,
+                        }
+                        self.new_sample.emit(sample)
+
+        finally:
+            try:
+                ser.close()
+            except Exception:
+                pass
+            print("[SERIAL] Closed")
+
+    def stop(self):
+        self.running = False
+
+
+# ===================== 主界面 =====================
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("WitMotion WTGAHRS3 上位机（陀螺仪动态曲线 + GPS地图轨迹）")
+        self.resize(1750, 920)
+
+        # 最新姿态（用于更新立方体）
+        self.latest_roll = 0.0
+        self.latest_pitch = 0.0
+        self.latest_yaw = 0.0
+
+        # 姿态初始化参考
+        self.att_ref_set = False
+        self.att_ref_roll = 0.0
+        self.att_ref_pitch = 0.0
+        self.att_ref_yaw = 0.0
+
+        # 离线数据
+        self.ins_data = None
+        self.gps_data = None
+        self.current_table_source = "INS"
+
+        # 原点（用于距离/方位角）
+        self.origin_set = False
+        self.origin_lat = 0.0
+        self.origin_lon = 0.0
+        self.origin_alt = 0.0
+
+        # 串口
+        self.connected = False
+        self.conn_baud = 115200
+        self._last_ports = []
+        self.serial_thread = None
+
+        # 表格抽样与限制
+        self.sample_count = 0
+        self.table_decimation = 5
+        self.max_table_rows = 5000
+
+        # ===== 陀螺仪曲线缓存（右下框）=====
+        self.gyro_t = []   # x 轴：相对时间(s)
+        self.gx_buf = []
+        self.gy_buf = []
+        self.gz_buf = []
+        self.gyro_max_points = 2500       # 滚动窗口长度
+        self._gyro_t0 = None              # 串口起始时间
+        self._gyro_update_counter = 0
+        self.gyro_plot_decimation = 2     # 每2帧刷新一次曲线，避免高频卡顿
+
+        # 地图窗口
+        self.map_win = None
+
+        self._init_ui()
+
+        # 3D 刷新
+        self.att_timer = QTimer(self)
+        self.att_timer.timeout.connect(self.update_cube_orientation)
+        self.att_timer.start(10)
+
+        # COM 刷新
+        self.port_timer = QTimer(self)
+        self.port_timer.timeout.connect(self.refresh_com_ports)
+        self.port_timer.start(1000)
+
+        if list_ports is not None:
+            self.refresh_com_ports()
+
+    # ---------- UI ----------
+
+    def _init_ui(self):
+        toolbar = QToolBar("MainToolbar")
+        toolbar.setIconSize(QSize(32, 32))
+        toolbar.setToolButtonStyle(Qt.ToolButtonTextUnderIcon)
+        self.addToolBar(toolbar)
+
+        style = self.style()
+
+        self.action_open_ins = QAction(style.standardIcon(QStyle.SP_DirOpenIcon), "打开INS日志", self)
+        self.action_open_ins.triggered.connect(self.on_open_ins)
+        toolbar.addAction(self.action_open_ins)
+
+        self.action_open_gps = QAction(style.standardIcon(QStyle.SP_DirOpenIcon), "打开GPS日志", self)
+        self.action_open_gps.triggered.connect(self.on_open_gps)
+        toolbar.addAction(self.action_open_gps)
+
+        self.action_clear = QAction(style.standardIcon(QStyle.SP_DialogResetButton), "清空数据", self)
+        self.action_clear.triggered.connect(self.on_clear_clicked)
+        toolbar.addAction(self.action_clear)
+
+        self.action_save = QAction(style.standardIcon(QStyle.SP_DialogSaveButton), "保存CSV", self)
+        self.action_save.triggered.connect(self.on_save_csv)
+        toolbar.addAction(self.action_save)
+
+        toolbar.addSeparator()
+
+        self.action_set_origin = QAction(style.standardIcon(QStyle.SP_DialogApplyButton), "设为原点", self)
+        self.action_set_origin.triggered.connect(self.on_set_origin_from_selected)
+        toolbar.addAction(self.action_set_origin)
+
+        self.action_zero_att = QAction(style.standardIcon(QStyle.SP_ArrowUp), "姿态归零", self)
+        self.action_zero_att.triggered.connect(self.on_zero_attitude)
+        toolbar.addAction(self.action_zero_att)
+
+        toolbar.addSeparator()
+
+        self.action_show_map = QAction(style.standardIcon(QStyle.SP_DialogOpenButton), "打开地图", self)
+        self.action_show_map.triggered.connect(self.on_open_map)
+        toolbar.addAction(self.action_show_map)
+
+        toolbar.addSeparator()
+
+        toolbar.addWidget(QLabel("串口: "))
+        self.combobox_com = QComboBox()
+        self.combobox_com.setMinimumWidth(110)
+        toolbar.addWidget(self.combobox_com)
+
+        toolbar.addWidget(QLabel("波特率: "))
+        self.baud_combo = QComboBox()
+        self.baud_combo.addItems(["4800", "9600", "19200", "38400", "57600", "115200", "230400"])
+        self.baud_combo.setCurrentText("9600")
+        toolbar.addWidget(self.baud_combo)
+
+        self.action_connect = QAction(style.standardIcon(QStyle.SP_DialogYesButton), "连接", self)
+        self.action_connect.setCheckable(True)
+        self.action_connect.toggled.connect(self.on_connect_toggled)
+        toolbar.addAction(self.action_connect)
+
+        toolbar.addSeparator()
+
+        toolbar.addWidget(QLabel("离线表格: "))
+        self.source_combo = QComboBox()
+        self.source_combo.addItems(["INS", "GPS"])
+        self.source_combo.currentIndexChanged.connect(self.on_source_changed)
+        toolbar.addWidget(self.source_combo)
+
+        toolbar.addSeparator()
+
+        self.action_reset_view = QAction(style.standardIcon(QStyle.SP_BrowserReload), "重置视角", self)
+        self.action_reset_view.triggered.connect(self.reset_view)
+        toolbar.addAction(self.action_reset_view)
+
+        toolbar.addWidget(QLabel("视图: "))
+        self.view_combo = QComboBox()
+        self.view_combo.addItems(["自由", "前视", "左视", "右视", "俯视"])
+        self.view_combo.currentIndexChanged.connect(self.on_view_changed)
+        toolbar.addWidget(self.view_combo)
+
+        toolbar.addSeparator()
+
+        self.mirror_checkbox = QCheckBox("左右镜像")
+        toolbar.addWidget(self.mirror_checkbox)
+
+        # 状态栏
+        self.conn_label = QLabel("未连接")
+        self.rows_label = QLabel("行数: 0")
+        self.info_label = QLabel("距离: -   方位角: -")
+        self.flag_label = QLabel("D0/D1/D2: - / - / -")
+        self.rate_label = QLabel("WTGAHRS3 0.2–200Hz | 9–36V | 4800–230400bps")
+
+        self.statusBar().addPermanentWidget(self.conn_label)
+        self.statusBar().addPermanentWidget(self.rows_label)
+        self.statusBar().addPermanentWidget(self.info_label)
+        self.statusBar().addPermanentWidget(self.flag_label)
+        self.statusBar().addPermanentWidget(self.rate_label)
+
+        # 中央布局：左表格 | 右(3D + 陀螺仪曲线)
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QHBoxLayout(central)
+        split_lr = QSplitter(Qt.Horizontal)
+        main_layout.addWidget(split_lr)
+
+        # 左：表格
+        self.table = QTableWidget()
+        self.table.setColumnCount(15)
+        self.table.setHorizontalHeaderLabels(
+            [
+                "序号", "时间(s)",
+                "纬度(°)", "经度(°)", "高度(m)",
+                "Roll(°)", "Pitch(°)", "Yaw(°)",
+                "Ax(g)", "Ay(g)", "Az(g)",
+                "Gx(°/s)", "Gy(°/s)", "Gz(°/s)",
+                "速度(m/s)",
+            ]
+        )
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SingleSelection)
+        self.table.setAlternatingRowColors(True)
+        self.table.itemSelectionChanged.connect(self.on_table_selection_changed)
+
+        table_group = QGroupBox("惯导 / GPS / AHRS 数据")
+        vbox_left = QVBoxLayout(table_group)
+        vbox_left.addWidget(self.table)
+
+        left_container = QWidget()
+        left_layout = QVBoxLayout(left_container)
+        left_layout.setContentsMargins(2, 2, 2, 2)
+        left_layout.addWidget(table_group)
+
+        # 右：上下分割 (3D + 陀螺仪曲线)
+        right_split = QSplitter(Qt.Vertical)
+
+        # 右上：3D
+        self.gl_view = gl.GLViewWidget()
+        self.gl_view.setBackgroundColor("k")
+        self.gl_view.opts["distance"] = 6.0
+        self.gl_view.opts["elevation"] = 25
+        self.gl_view.opts["azimuth"] = -45
+        self.gl_view.keyPressEvent = self.gl_key_press_event
+
+        self.axis_items = []
+        self.cube_edges = []
+        self.cube_verts_orig = None
+        self.cube_edge_indices = None
+        self._init_3d_scene()
+
+        # 右下：陀螺仪动态曲线
+        gyro_group = QGroupBox("陀螺仪动态曲线（Gx/Gy/Gz, deg/s）")
+        gyro_layout = QVBoxLayout(gyro_group)
+
+        self.gyro_plot = pg.PlotWidget()
+        self.gyro_plot.setBackground("k")
+        self.gyro_plot.showGrid(x=True, y=True, alpha=0.25)
+        self.gyro_plot.setLabel("bottom", "Time (s)")
+        self.gyro_plot.setLabel("left", "Gyro (deg/s)")
+        self.gyro_plot.addLegend(offset=(10, 10))
+        self.gyro_plot.enableAutoRange(axis=pg.ViewBox.XYAxes, enable=True)
+
+        self.gx_curve = self.gyro_plot.plot([], [], pen=pg.mkPen((0, 255, 106), width=2), name="Gx")
+        self.gy_curve = self.gyro_plot.plot([], [], pen=pg.mkPen((80, 160, 255), width=2), name="Gy")
+        self.gz_curve = self.gyro_plot.plot([], [], pen=pg.mkPen((255, 180, 60), width=2), name="Gz")
+
+        gyro_layout.addWidget(self.gyro_plot)
+
+        right_split.addWidget(self.gl_view)
+        right_split.addWidget(gyro_group)
+        right_split.setStretchFactor(0, 3)
+        right_split.setStretchFactor(1, 2)
+        right_split.setSizes([540, 320])
+
+        split_lr.addWidget(left_container)
+        split_lr.addWidget(right_split)
+        split_lr.setStretchFactor(0, 0)
+        split_lr.setStretchFactor(1, 1)
+        split_lr.setSizes([560, 1140])
+
+    # ---------- 地图 ----------
+
+    def on_open_map(self):
+        if self.map_win is None:
+            self.map_win = MapWindow(self)
+        self.map_win.show()
+        self.map_win.raise_()
+        self.map_win.activateWindow()
+
+        if not WEBENGINE_OK:
+            QMessageBox.information(self, "提示", "当前环境未安装 PyQtWebEngine，地图功能不可用。")
+
+    # ---------- COM 自动扫描 ----------
+
+    def refresh_com_ports(self):
+        if list_ports is None:
+            self.combobox_com.clear()
+            self.combobox_com.addItem("未安装pyserial")
+            self.combobox_com.setEnabled(False)
+            return
+
+        ports = list(list_ports.comports())
+        names = [p.device for p in ports]
+
+        if names == self._last_ports and self.combobox_com.count() > 0:
+            return
+
+        self._last_ports = names
+
+        self.combobox_com.blockSignals(True)
+        current = self.combobox_com.currentText().strip()
+        self.combobox_com.clear()
+
+        if not names:
+            self.combobox_com.addItem("无串口")
+            self.combobox_com.setEnabled(False)
+        else:
+            self.combobox_com.setEnabled(True)
+            self.combobox_com.addItems(names)
+            if current in names:
+                self.combobox_com.setCurrentText(current)
+
+        self.combobox_com.blockSignals(False)
+
+    def on_connect_toggled(self, checked: bool):
+        try:
+            self.conn_baud = int(self.baud_combo.currentText())
+        except ValueError:
+            QMessageBox.warning(self, "错误", "无效的波特率")
+            self._reset_connect_action(False)
+            return
+
+        if serial is None or list_ports is None:
+            QMessageBox.warning(self, "错误", "未安装 pyserial，无法使用串口")
+            self._reset_connect_action(False)
+            return
+
+        self.refresh_com_ports()
+        com_name = self.combobox_com.currentText().strip()
+        if not com_name or "无串口" in com_name or "pyserial" in com_name:
+            QMessageBox.warning(self, "错误", "当前没有可用的串口")
+            self._reset_connect_action(False)
+            return
+
+        if checked:
+            if self.serial_thread is not None:
+                self.serial_thread.stop()
+                self.serial_thread.wait(500)
+                self.serial_thread = None
+
+            # 姿态参考复位（第一帧当零位）
+            self.att_ref_set = False
+
+            # 原点默认重置（若有GPS，第一条自动设）
+            self.origin_set = False
+
+            # 清空陀螺仪曲线缓存
+            self._gyro_t0 = None
+            self.gyro_t.clear()
+            self.gx_buf.clear()
+            self.gy_buf.clear()
+            self.gz_buf.clear()
+            self._refresh_gyro_plot(force_autorange=True)
+
+            self.serial_thread = WITSerialReader(com_name, self.conn_baud)
+            self.serial_thread.new_sample.connect(self.on_serial_sample)
+            self.serial_thread.start()
+
+            self.connected = True
+            self.action_connect.setText("断开")
+            self.conn_label.setText(f"已连接: {com_name}@{self.conn_baud}")
+        else:
+            if self.serial_thread is not None:
+                self.serial_thread.stop()
+                self.serial_thread.wait(500)
+                self.serial_thread = None
+
+            self.connected = False
+            self.action_connect.setText("连接")
+            self.conn_label.setText("未连接")
+
+    def _reset_connect_action(self, checked: bool):
+        self.action_connect.blockSignals(True)
+        self.action_connect.setChecked(checked)
+        self.action_connect.blockSignals(False)
+
+    # ---------- 姿态归零（手动） ----------
+
+    def on_zero_attitude(self):
+        self.att_ref_roll += float(self.latest_roll)
+        self.att_ref_pitch += float(self.latest_pitch)
+        self.att_ref_yaw += float(self.latest_yaw)
+        self.att_ref_set = True
+        self.latest_roll = 0.0
+        self.latest_pitch = 0.0
+        self.latest_yaw = 0.0
+        self.statusBar().showMessage("✅ 姿态已归零（以当前姿态作为初始化姿态）", 2500)
+
+    # ---------- 串口实时样本回调 ----------
+
+    def on_serial_sample(self, sample: dict):
+        # ===== 1) 姿态初始化：第一帧作为“初始化姿态” =====
+        roll_raw = sample.get("roll")
+        pitch_raw = sample.get("pitch")
+        yaw_raw = sample.get("yaw")
+
+        if roll_raw is not None and pitch_raw is not None and yaw_raw is not None:
+            rr = float(roll_raw)
+            pp = float(pitch_raw)
+            yy = float(yaw_raw)
+
+            if not self.att_ref_set:
+                self.att_ref_roll = rr
+                self.att_ref_pitch = pp
+                self.att_ref_yaw = yy
+                self.att_ref_set = True
+                self.statusBar().showMessage("✅ 姿态初始化完成：已记录上电初始姿态为零位", 3000)
+
+            self.latest_roll = _angle_wrap_deg(rr - self.att_ref_roll)
+            self.latest_pitch = _angle_wrap_deg(pp - self.att_ref_pitch)
+            self.latest_yaw = _angle_wrap_deg(yy - self.att_ref_yaw)
+
+        # ===== 2) 陀螺仪曲线更新（右下框）=====
+        self._append_gyro_series(sample)
+
+        # ===== 3) GPS 地图叠加（如果 sample 有 lat/lon）=====
+        lat = sample.get("lat")
+        lon = sample.get("lon")
+        alt = sample.get("alt")
+        if lat is not None and lon is not None and alt is not None:
+            if not self.origin_set:
+                self.origin_lat, self.origin_lon, self.origin_alt = float(lat), float(lon), float(alt)
+                self.origin_set = True
+            if self.map_win is not None:
+                try:
+                    self.map_win.add_gps_point(float(lat), float(lon))
+                except Exception:
+                    pass
+
+        # ===== 4) 表格抽样插入 =====
+        self.sample_count += 1
+        if self.sample_count % self.table_decimation != 0:
+            return
+
+        row = self.table.rowCount()
+        if row >= self.max_table_rows:
+            self.table.setUpdatesEnabled(False)
+            self.table.removeRow(0)
+            row = self.table.rowCount()
+            self.table.setUpdatesEnabled(True)
+
+        self.table.setUpdatesEnabled(False)
+        self.table.insertRow(row)
+
+        def fmt(v, fmt_str):
+            if v is None:
+                return ""
+            try:
+                return fmt_str.format(v)
+            except Exception:
+                return str(v)
+
+        values = [
+            str(row),
+            fmt(sample.get("time"), "{:.3f}"),
+            fmt(sample.get("lat"), "{:.7f}"),
+            fmt(sample.get("lon"), "{:.7f}"),
+            fmt(sample.get("alt"), "{:.3f}"),
+            fmt(self.latest_roll, "{:.3f}"),
+            fmt(self.latest_pitch, "{:.3f}"),
+            fmt(self.latest_yaw, "{:.3f}"),
+            fmt(sample.get("ax"), "{:.5f}"),
+            fmt(sample.get("ay"), "{:.5f}"),
+            fmt(sample.get("az"), "{:.5f}"),
+            fmt(sample.get("gx"), "{:.5f}"),
+            fmt(sample.get("gy"), "{:.5f}"),
+            fmt(sample.get("gz"), "{:.5f}"),
+            fmt(sample.get("speed"), "{:.3f}"),
+        ]
+
+        for c, v in enumerate(values):
+            item = QTableWidgetItem(v)
+            item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            self.table.setItem(row, c, item)
+
+        self.table.setUpdatesEnabled(True)
+        if row < 5:
+            self.table.resizeColumnsToContents()
+        self.rows_label.setText(f"行数: {self.table.rowCount()}")
+
+    def _append_gyro_series(self, sample: dict):
+        gx = sample.get("gx")
+        gy = sample.get("gy")
+        gz = sample.get("gz")
+        t = sample.get("time")
+        if gx is None or gy is None or gz is None or t is None:
+            return
+
+        t = float(t)
+        if self._gyro_t0 is None:
+            self._gyro_t0 = t
+        x = t - self._gyro_t0
+
+        self.gyro_t.append(x)
+        self.gx_buf.append(float(gx))
+        self.gy_buf.append(float(gy))
+        self.gz_buf.append(float(gz))
+
+        # 滚动窗口裁剪
+        if len(self.gyro_t) > self.gyro_max_points:
+            cut = len(self.gyro_t) - self.gyro_max_points
+            del self.gyro_t[:cut]
+            del self.gx_buf[:cut]
+            del self.gy_buf[:cut]
+            del self.gz_buf[:cut]
+
+        # 节流刷新
+        self._gyro_update_counter += 1
+        if self._gyro_update_counter % max(1, self.gyro_plot_decimation) != 0:
+            return
+
+        self._refresh_gyro_plot(force_autorange=False)
+
+    def _refresh_gyro_plot(self, force_autorange: bool):
+        if len(self.gyro_t) == 0:
+            self.gx_curve.setData([], [])
+            self.gy_curve.setData([], [])
+            self.gz_curve.setData([], [])
+            if force_autorange:
+                self.gyro_plot.enableAutoRange(axis=pg.ViewBox.XYAxes, enable=True)
+            return
+
+        xs = np.asarray(self.gyro_t, dtype=float)
+        gx = np.asarray(self.gx_buf, dtype=float)
+        gy = np.asarray(self.gy_buf, dtype=float)
+        gz = np.asarray(self.gz_buf, dtype=float)
+
+        self.gx_curve.setData(xs, gx)
+        self.gy_curve.setData(xs, gy)
+        self.gz_curve.setData(xs, gz)
+
+        if force_autorange:
+            self.gyro_plot.enableAutoRange(axis=pg.ViewBox.XYAxes, enable=True)
+        else:
+            self.gyro_plot.enableAutoRange(axis=pg.ViewBox.XYAxes, enable=True)
+
+    # ---------- 3D 场景 ----------
+
+    def _init_3d_scene(self):
+        axis_len = 2.5
+        x = gl.GLLinePlotItem(
+            pos=np.array([[0, 0, 0], [axis_len, 0, 0]]),
+            color=(1, 0, 0, 1), width=2, antialias=True,
+        )
+        y = gl.GLLinePlotItem(
+            pos=np.array([[0, 0, 0], [0, axis_len, 0]]),
+            color=(0, 1, 0, 1), width=2, antialias=True,
+        )
+        z = gl.GLLinePlotItem(
+            pos=np.array([[0, 0, 0], [0, 0, axis_len]]),
+            color=(0, 0, 1, 1), width=2, antialias=True,
+        )
+        self.gl_view.addItem(x)
+        self.gl_view.addItem(y)
+        self.gl_view.addItem(z)
+        self.axis_items = [x, y, z]
+
+        cube_len = 1.2
+        half = cube_len / 2.0
+
+        verts = np.array([
+            [-half, -half, -half],
+            [ half, -half, -half],
+            [ half,  half, -half],
+            [-half,  half, -half],
+            [-half, -half,  half],
+            [ half, -half,  half],
+            [ half,  half,  half],
+            [-half,  half,  half],
+        ], dtype=float)
+
+        edges = [
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        ]
+
+        self.cube_verts_orig = verts
+        self.cube_edge_indices = edges
+        self.cube_edges = []
+
+        for i, j in edges:
+            line = gl.GLLinePlotItem(
+                pos=np.array([verts[i], verts[j]]),
+                color=(0, 1, 0, 1), width=2, antialias=True,
+            )
+            self.gl_view.addItem(line)
+            self.cube_edges.append(line)
+
+    def update_cube_orientation(self):
+        if self.cube_verts_orig is None or self.cube_edge_indices is None:
+            return
+
+        roll = self.latest_roll
+        pitch = self.latest_pitch
+        yaw = self.latest_yaw
+
+        R = euler_to_rotation_matrix(roll, pitch, yaw)
+        verts = self.cube_verts_orig
+        new_verts = (R @ verts.T).T
+
+        if self.mirror_checkbox.isChecked():
+            new_verts[:, 0] = -new_verts[:, 0]
+
+        dist = float(self.gl_view.opts.get("distance", 6.0))
+        el_deg = float(self.gl_view.opts.get("elevation", 25.0))
+        az_deg = float(self.gl_view.opts.get("azimuth", -45.0))
+
+        el = math.radians(el_deg)
+        az = math.radians(az_deg)
+
+        cam_x = dist * math.cos(el) * math.cos(az)
+        cam_y = dist * math.cos(el) * math.sin(az)
+        cam_z = dist * math.sin(el)
+        cam_pos = np.array([cam_x, cam_y, cam_z], dtype=float)
+
+        half = np.max(np.abs(self.cube_verts_orig))
+        approx_delta = math.sqrt(3.0) * half
+        d_min = max(0.001, dist - approx_delta)
+        d_max = dist + approx_delta
+
+        w_min = 1.0
+        w_max = 4.0
+
+        for idx, (i, j) in enumerate(self.cube_edge_indices):
+            p0 = new_verts[i]
+            p1 = new_verts[j]
+            mid = 0.5 * (p0 + p1)
+            d = float(np.linalg.norm(mid - cam_pos))
+
+            t = (d - d_min) / (d_max - d_min) if d_max > d_min else 0.5
+            t = max(0.0, min(1.0, t))
+            width = w_max - t * (w_max - w_min)
+
+            self.cube_edges[idx].setData(pos=np.array([p0, p1]), width=width)
+
+    # ---------- 文件加载（离线 CSV） ----------
+
+    def on_open_ins(self):
+        path, _ = QFileDialog.getOpenFileName(self, "打开 INS CSV", "", "CSV 文件 (*.csv);;所有文件 (*)")
+        if not path:
+            return
+        try:
+            data = load_csv_generic(path)
+        except Exception as e:
+            QMessageBox.warning(self, "错误", str(e))
+            return
+
+        self.ins_data = data
+        self.current_table_source = "INS"
+        self.source_combo.setCurrentText("INS")
+
+        self.setup_origin_if_needed(data)
+        self.setup_att_ref_if_needed(data)
+        self.update_table_from_data(data)
+        self.update_gyro_plot_from_data(data)
+
+    def on_open_gps(self):
+        path, _ = QFileDialog.getOpenFileName(self, "打开 GPS CSV", "", "CSV 文件 (*.csv);;所有文件 (*)")
+        if not path:
+            return
+        try:
+            data = load_csv_generic(path)
+        except Exception as e:
+            QMessageBox.warning(self, "错误", str(e))
+            return
+
+        self.gps_data = data
+        self.current_table_source = "GPS"
+        self.source_combo.setCurrentText("GPS")
+
+        self.setup_origin_if_needed(data)
+        self.setup_att_ref_if_needed(data)
+        self.update_table_from_data(data)
+        self.update_gyro_plot_from_data(data)
+
+        # 地图窗口补画（GPS）
+        if self.map_win is not None:
+            lat = data.get("lat")
+            lon = data.get("lon")
+            if lat is not None and lon is not None:
+                for i in range(len(lat)):
+                    try:
+                        self.map_win.add_gps_point(float(lat[i]), float(lon[i]))
+                    except Exception:
+                        pass
+
+    def setup_origin_if_needed(self, data):
+        if (not self.origin_set) and (data.get("lat") is not None):
+            self.origin_lat = float(data["lat"][0])
+            self.origin_lon = float(data["lon"][0])
+            self.origin_alt = float(data["alt"][0])
+            self.origin_set = True
+
+    def setup_att_ref_if_needed(self, data):
+        r = data.get("roll")
+        p = data.get("pitch")
+        y = data.get("yaw")
+        if (not self.att_ref_set) and (r is not None) and (p is not None) and (y is not None) and len(r) > 0:
+            self.att_ref_roll = float(r[0])
+            self.att_ref_pitch = float(p[0])
+            self.att_ref_yaw = float(y[0])
+            self.att_ref_set = True
+            self.latest_roll = 0.0
+            self.latest_pitch = 0.0
+            self.latest_yaw = 0.0
+
+    def update_gyro_plot_from_data(self, data):
+        """离线：用 time/gx/gy/gz 构建陀螺仪曲线"""
+        t = data.get("time")
+        gx = data.get("gx")
+        gy = data.get("gy")
+        gz = data.get("gz")
+        if t is None or gx is None or gy is None or gz is None:
+            # 没有陀螺仪列就清空
+            self._gyro_t0 = None
+            self.gyro_t.clear()
+            self.gx_buf.clear()
+            self.gy_buf.clear()
+            self.gz_buf.clear()
+            self._refresh_gyro_plot(force_autorange=True)
+            return
+
+        t = np.asarray(t, dtype=float)
+        gx = np.asarray(gx, dtype=float)
+        gy = np.asarray(gy, dtype=float)
+        gz = np.asarray(gz, dtype=float)
+
+        # x 轴用相对时间，避免很大时间戳
+        t0 = float(t[0]) if len(t) > 0 else 0.0
+        xs = (t - t0).tolist()
+
+        self._gyro_t0 = None  # 离线模式不使用串口 t0
+        self.gyro_t = xs[-self.gyro_max_points:]
+        self.gx_buf = gx.tolist()[-self.gyro_max_points:]
+        self.gy_buf = gy.tolist()[-self.gyro_max_points:]
+        self.gz_buf = gz.tolist()[-self.gyro_max_points:]
+
+        self._refresh_gyro_plot(force_autorange=True)
+
+    # ---------- 清空 & 保存 CSV ----------
+
+    def on_clear_clicked(self):
+        self.ins_data = None
+        self.gps_data = None
+
+        self.origin_set = False
+        self.att_ref_set = False
+
+        # 清空曲线
+        self._gyro_t0 = None
+        self.gyro_t.clear()
+        self.gx_buf.clear()
+        self.gy_buf.clear()
+        self.gz_buf.clear()
+        self._refresh_gyro_plot(force_autorange=True)
+
+        self.table.setRowCount(0)
+        self.rows_label.setText("行数: 0")
+        self.info_label.setText("距离: -   方位角: -")
+        self.flag_label.setText("D0/D1/D2: - / - / -")
+
+    def on_save_csv(self):
+        if self.table.rowCount() == 0:
+            QMessageBox.information(self, "提示", "当前没有数据可保存。")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(self, "保存当前表格为 CSV", "", "CSV 文件 (*.csv);;所有文件 (*)")
+        if not path:
+            return
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                headers = [self.table.horizontalHeaderItem(c).text() for c in range(self.table.columnCount())]
+                writer.writerow(headers)
+
+                for r in range(self.table.rowCount()):
+                    row_vals = []
+                    for c in range(self.table.columnCount()):
+                        item = self.table.item(r, c)
+                        row_vals.append("" if item is None else item.text())
+                    writer.writerow(row_vals)
+
+            QMessageBox.information(self, "成功", "CSV 保存完成。")
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"保存失败: {e}")
+
+    # ---------- 手动设原点 ----------
+
+    def on_set_origin_from_selected(self):
+        row = self.table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "提示", "请先选中一行，再设为原点。")
+            return
+
+        try:
+            lat_txt = self.table.item(row, 2).text() if self.table.item(row, 2) else ""
+            lon_txt = self.table.item(row, 3).text() if self.table.item(row, 3) else ""
+            alt_txt = self.table.item(row, 4).text() if self.table.item(row, 4) else ""
+            if not lat_txt or not lon_txt or not alt_txt:
+                QMessageBox.warning(self, "错误", "该行缺少 lat/lon/alt，无法设为原点。")
+                return
+
+            self.origin_lat = float(lat_txt)
+            self.origin_lon = float(lon_txt)
+            self.origin_alt = float(alt_txt)
+            self.origin_set = True
+
+            self.statusBar().showMessage(
+                f"✅ 已手动设原点：lat={self.origin_lat:.7f}, lon={self.origin_lon:.7f}, alt={self.origin_alt:.2f}",
+                5000
+            )
+
+            self.on_table_selection_changed()
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"设原点失败: {e}")
+
+    # ---------- 视角 / 表格源 ----------
+
+    def on_source_changed(self, index):
+        self.current_table_source = "INS" if index == 0 else "GPS"
+        data = self.ins_data if self.current_table_source == "INS" else self.gps_data
+        if data is not None:
+            self.update_table_from_data(data)
+            self.update_gyro_plot_from_data(data)
+
+    def reset_view(self):
+        self.gl_view.opts["elevation"] = 25
+        self.gl_view.opts["azimuth"] = -45
+        self.gl_view.opts["distance"] = 6.0
+        self.gl_view.update()
+
+    def on_view_changed(self, index):
+        if index == 0:
+            return
+        elif index == 1:
+            self.gl_view.opts["elevation"] = 0
+            self.gl_view.opts["azimuth"] = 0
+        elif index == 2:
+            self.gl_view.opts["elevation"] = 0
+            self.gl_view.opts["azimuth"] = 90
+        elif index == 3:
+            self.gl_view.opts["elevation"] = 0
+            self.gl_view.opts["azimuth"] = -90
+        elif index == 4:
+            self.gl_view.opts["elevation"] = 90
+            self.gl_view.opts["azimuth"] = -90
+        self.gl_view.update()
+
+    # ---------- 表格（离线 CSV 全部显示） ----------
+
+    def update_table_from_data(self, data):
+        n = len(data["time"])
+        self.table.setUpdatesEnabled(False)
+        self.table.setRowCount(n)
+
+        roll = data.get("roll")
+        pitch = data.get("pitch")
+        yaw = data.get("yaw")
+
+        ax = data.get("ax")
+        ay = data.get("ay")
+        az = data.get("az")
+
+        gx = data.get("gx")
+        gy = data.get("gy")
+        gz = data.get("gz")
+
+        speed = data.get("speed")
+
+        for i in range(n):
+            r_disp = "" if roll is None else f"{_angle_wrap_deg(float(roll[i]) - self.att_ref_roll):.3f}" if self.att_ref_set else f"{float(roll[i]):.3f}"
+            p_disp = "" if pitch is None else f"{_angle_wrap_deg(float(pitch[i]) - self.att_ref_pitch):.3f}" if self.att_ref_set else f"{float(pitch[i]):.3f}"
+            y_disp = "" if yaw is None else f"{_angle_wrap_deg(float(yaw[i]) - self.att_ref_yaw):.3f}" if self.att_ref_set else f"{float(yaw[i]):.3f}"
+
+            values = [
+                str(i),
+                f"{data['time'][i]:.3f}",
+                f"{data['lat'][i]:.7f}",
+                f"{data['lon'][i]:.7f}",
+                f"{data['alt'][i]:.3f}",
+                r_disp,
+                p_disp,
+                y_disp,
+                "" if ax is None else f"{ax[i]:.5f}",
+                "" if ay is None else f"{ay[i]:.5f}",
+                "" if az is None else f"{az[i]:.5f}",
+                "" if gx is None else f"{gx[i]:.5f}",
+                "" if gy is None else f"{gy[i]:.5f}",
+                "" if gz is None else f"{gz[i]:.5f}",
+                "" if speed is None else f"{speed[i]:.3f}",
+            ]
+            for c, v in enumerate(values):
+                item = QTableWidgetItem(v)
+                item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.table.setItem(i, c, item)
+
+        self.table.setUpdatesEnabled(True)
+        self.table.resizeColumnsToContents()
+        self.rows_label.setText(f"行数: {n}")
+
+    def on_table_selection_changed(self):
+        row = self.table.currentRow()
+        if row < 0:
+            self.info_label.setText("距离: -   方位角: -")
+            self.flag_label.setText("D0/D1/D2: - / - / -")
+            return
+
+        lat_txt = self.table.item(row, 2).text() if self.table.item(row, 2) else ""
+        lon_txt = self.table.item(row, 3).text() if self.table.item(row, 3) else ""
+        alt_txt = self.table.item(row, 4).text() if self.table.item(row, 4) else ""
+
+        if (not self.origin_set) or (not lat_txt) or (not lon_txt) or (not alt_txt):
+            self.info_label.setText("距离: -   方位角: -")
+        else:
+            try:
+                lat_v = float(lat_txt)
+                lon_v = float(lon_txt)
+                alt_v = float(alt_txt)
+                e, n, _ = geo_to_enu(lat_v, lon_v, alt_v,
+                                     self.origin_lat, self.origin_lon, self.origin_alt)
+                dist = math.hypot(e, n)
+                az = math.degrees(math.atan2(e, n))
+                self.info_label.setText(f"距离: {dist:.2f} m   方位角: {az:.2f}°")
+            except Exception:
+                self.info_label.setText("距离: -   方位角: -")
+
+        data = self.ins_data if self.current_table_source == "INS" else self.gps_data
+        if data is None:
+            self.flag_label.setText("D0/D1/D2: - / - / -")
+            return
+
+        d0_arr = data.get("d0")
+        d1_arr = data.get("d1")
+        d2_arr = data.get("d2")
+
+        def val_or_dash(arr):
+            if arr is None or row >= len(arr):
+                return "-"
+            try:
+                return int(arr[row])
+            except Exception:
+                return "-"
+
+        d0v = val_or_dash(d0_arr)
+        d1v = val_or_dash(d1_arr)
+        d2v = val_or_dash(d2_arr)
+
+        if d0v == d1v == d2v == "-":
+            self.flag_label.setText("D0/D1/D2: - / - / -")
+        else:
+            self.flag_label.setText(f"D0/D1/D2: {d0v} / {d1v} / {d2v}")
+
+    # ---------- 键盘 ----------
+
+    def gl_key_press_event(self, event):
+        if event.key() == Qt.Key_R:
+            self.reset_view()
+        else:
+            gl.GLViewWidget.keyPressEvent(self.gl_view, event)
+
+    # ---------- 退出 ----------
+
+    def closeEvent(self, event):
+        if self.serial_thread is not None:
+            self.serial_thread.stop()
+            self.serial_thread.wait(500)
+            self.serial_thread = None
+        event.accept()
+
+
+# ===================== 主入口 =====================
+
+def main():
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()

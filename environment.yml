@@ -1,0 +1,43 @@
+name: ROS_platform
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  # --- Python 版本建议固定，便于复现 ---
+  - python=3.10
+
+  # --- 基础科学栈/工具 ---
+  - pip
+  - numpy
+  - scipy
+  - pandas
+  - matplotlib
+  - pillow
+  - pyyaml
+  - requests
+  - psutil
+
+  # --- GUI：Qt + WebEngine（强烈建议 conda-forge） ---
+  - pyqt=5
+  - pyqtwebengine=5
+
+  # --- 视觉：OpenCV（conda 更稳） ---
+  - opencv
+
+  # --- pip 部分：更偏“扩展模块/更新快”的依赖 ---
+  - pip:
+      # PyInstaller 打包
+      - pyinstaller>=6.0
+
+      # 视频解码/低延迟（PyAV）
+      - av
+
+      # 绘图/3D（IMU/点云等常用）
+      - pyqtgraph
+      - PyOpenGL
+      - PyOpenGL_accelerate
+
+      # CAN：python-can + CANalyst-II 后端
+      - python-can
+      - python-can[canalystii]
+      - pyusb
